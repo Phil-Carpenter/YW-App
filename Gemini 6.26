@@ -1,0 +1,386 @@
+import streamlit as st
+import pandas as pd
+import glob
+import os
+from datetime import datetime, date, timedelta
+import calendar
+import io # Import the io module for in-memory file operations
+
+# --- Configuration ---
+# Directly setting paths, no longer user-configurable via text input
+KEY_FILE_PATH = r"C:\Users\PCarpenter\Desktop\Python\PartKey.xlsx"
+MONTHLY_DIR_PATH = r"C:\Users\PCarpenter\Desktop\Python"
+
+CURRENT_YEAR = datetime.today().year # This will dynamically get the current year
+
+# --- SET PAGE CONFIG - MUST BE FIRST STREAMLIT COMMAND ---
+st.set_page_config(page_title="AACT Customer Shipment Overview", layout="wide")
+
+# Removed the custom CSS for multiselect tags to avoid conflicts/issues.
+
+st.markdown(
+    "# <span style='color:blue; font-weight:bold;'>AACT</span> Customer Shipment Overview",
+    unsafe_allow_html=True
+)
+
+# --- Helper Function: Calculate Next Business Day ---
+def get_next_business_day(start_date):
+    """Calculates the first business day (Mon-Fri) strictly after start_date."""
+    next_day = start_date + timedelta(days=1)
+    # Loop until a weekday (Monday=0, Tuesday=1, ..., Friday=4) is found
+    while next_day.weekday() >= 5: # Saturday is 5, Sunday is 6
+        next_day += timedelta(days=1)
+    return next_day
+
+# --- Functions with Caching ---
+@st.cache_data
+def load_and_standardize_part_key(file_path):
+    """
+    Loads the Part Key Excel file, standardizes column names, and cleans data.
+    Returns the cleaned DataFrame and a set of customer part numbers.
+    """
+    if not os.path.exists(file_path):
+        st.error(f"Key file not found: `{file_path}`")
+        st.stop()
+
+    try:
+        raw_key = pd.read_excel(file_path, header=0, engine='openpyxl')
+    except Exception as e:
+        st.error(f"Error reading Part Key file `{file_path}`: {e}")
+        st.stop()
+
+    raw_key.columns = [c.strip() for c in raw_key.columns]
+
+    rename_map = {}
+    for col in raw_key.columns:
+        c = col.strip().lower()
+        if c == 'customer part number':
+            rename_map[col] = 'Customer Part Number'
+        elif c in ('part description','description','part desc'):
+            rename_map[col] = 'Description'
+        elif 'aact' in c and 'part number' in c:
+            rename_map[col] = 'AACT Part Number'
+        elif 'part type' in c:
+            rename_map[col] = 'Part Type'
+        elif 'customer' in c and 'customer part number' not in c:
+            rename_map[col] = 'Customer'
+    df_key = raw_key.rename(columns=rename_map)
+
+    for req in ['Customer Part Number','Description']:
+        if req not in df_key.columns:
+            st.error(f"Key missing required column '{req}'. Please ensure the key file has these columns.")
+            st.stop()
+
+    # Ensure these columns exist, providing a default if not found
+    df_key['AACT Part Number'] = df_key.get('AACT Part Number', None)
+    df_key['Part Type'] = df_key.get('Part Type', 'All')
+    df_key['Customer'] = df_key.get('Customer', 'All')
+
+    # FIX: Explicitly convert 'AACT Part Number' to string to prevent ArrowTypeError
+    if 'AACT Part Number' in df_key.columns:
+        df_key['AACT Part Number'] = df_key['AACT Part Number'].astype(str).replace('None', '') # Replace 'None' string if it came from .get(..., None)
+
+    for col in ['Customer Part Number','Description']:
+        df_key[col] = df_key[col].astype(str).str.replace(r"\.0+$","",regex=True).str.strip()
+    df_key = df_key[~df_key['Description'].str.upper().isin(['N/A','NA','NONE'])]
+    df_key = df_key.dropna(subset=['Customer Part Number','Description']).drop_duplicates(subset='Customer Part Number', keep='last')
+
+    key_set = set(df_key['Customer Part Number'])
+    return df_key, key_set
+
+@st.cache_data
+def load_and_aggregate_shipment_data(monthly_dir, start_date, end_date, year, key_set):
+    """
+    Discovers monthly Excel files, loads sheets within the specified date range,
+    cleans part numbers, and aggregates shipment volumes.
+    Returns a DataFrame of raw shipment records.
+    """
+    if not os.path.isdir(monthly_dir):
+        st.error(f"Monthly Data directory not found: `{monthly_dir}`. Please check the path.")
+        return pd.DataFrame()
+
+    all_files = glob.glob(os.path.join(monthly_dir, "*.xlsx"))
+    file_map = {}
+    for fp in all_files:
+        fn = os.path.basename(fp)
+        parts = fn.split('.',1)
+        try:
+            idx = int(parts[0])
+            file_map[idx] = fp
+        except ValueError:
+            continue
+
+    dates_index = pd.date_range(start_date, end_date)
+    months_to_load = sorted({d.month for d in dates_index})
+
+    records = []
+    progress_bar = st.progress(0, text="Loading monthly data...")
+    
+    for i, month in enumerate(months_to_load):
+        progress_bar.progress((i + 1) / len(months_to_load), text=f"Loading month {calendar.month_name[month]} data...")
+        path = file_map.get(month)
+        if not path:
+            continue
+
+        try:
+            xls = pd.ExcelFile(path, engine='openpyxl')
+        except Exception as e:
+            st.warning(f"Could not open workbook '{os.path.basename(path)}': {e}. Skipping.")
+            continue
+        
+        for sheet in xls.sheet_names:
+            num = ''.join(filter(str.isdigit, sheet))
+            if not num: continue
+
+            try:
+                day = int(num)
+                current_date = date(year, month, day)
+            except ValueError:
+                continue
+
+            if not (start_date <= current_date <= end_date):
+                continue
+
+            try:
+                df = pd.read_excel(xls, sheet_name=sheet, header=3, engine='openpyxl')
+            except Exception as e:
+                st.warning(f"Could not read sheet '{sheet}' from '{os.path.basename(path)}': {e}. Skipping sheet.")
+                continue
+
+            if 'Customer Part #' not in df.columns or 'Actual Ship Qty' not in df.columns:
+                st.warning(f"Sheet '{sheet}' in '{os.path.basename(path)}' missing required columns ('Customer Part #' or 'Actual Ship Qty'). Skipping sheet.")
+                continue
+
+            df = df.dropna(subset=['Customer Part #'])
+            df['Customer Part #'] = (
+                df['Customer Part #'].astype(str)
+                    .str.replace(r"\.0+$", "", regex=True)
+                    .str.strip()
+            )
+
+            def normalize_part_number(x, key_set_local):
+                if x in key_set_local:
+                    return x
+                if x.endswith('00') and x[:-2] in key_set_local:
+                    return x[:-2]
+                if x + '00' in key_set_local:
+                    return x + '00'
+                return x
+
+            df['NormPart'] = df['Customer Part #'].apply(lambda x: normalize_part_number(x, key_set))
+            df['Volume'] = pd.to_numeric(df['Actual Ship Qty'], errors='coerce').fillna(0)
+
+            records.append(
+                pd.DataFrame({
+                    'Date': current_date,
+                    'NormPart': df['NormPart'],
+                    'Volume': df['Volume']
+                })
+            )
+    progress_bar.empty()
+
+    if not records:
+        return pd.DataFrame()
+
+    full = pd.concat(records, ignore_index=True)
+    full = full.dropna(subset=['NormPart'])
+    return full
+
+# --- Main Application Logic ---
+
+# Sidebar: Configuration (displaying fixed paths)
+st.sidebar.header("Data Locations")
+st.sidebar.markdown(f"**Part Key File:** `{KEY_FILE_PATH}`")
+st.sidebar.markdown(f"**Monthly Data Directory:** `{MONTHLY_DIR_PATH}`")
+
+st.sidebar.header("Date Range Selection")
+
+# NEW DEFAULT DATE RANGE LOGIC (2 weeks, today + 5 days from end)
+today_picker_default = date.today() # Current date
+# Calculate end date to be 5 days from today
+default_end = today_picker_default + timedelta(days=5)
+# Calculate start date to make a total of 14 days (2 weeks)
+default_start = default_end - timedelta(days=13) # Default date range: [today-8 days, today+5 days] for 14 days total
+
+start_date = st.sidebar.date_input("Start date", default_start)
+end_date = st.sidebar.date_input("End date", default_end)
+if start_date > end_date:
+    st.sidebar.error("Start date must be on or before end date.")
+    st.stop()
+
+# Load Part Key
+df_key, key_set = load_and_standardize_part_key(KEY_FILE_PATH)
+
+# Sidebar Filters: Part Type & Customer
+part_types = sorted(df_key['Part Type'].unique())
+selected_types = st.sidebar.multiselect("Filter by Part Type", part_types, default=part_types)
+customers = sorted(df_key['Customer'].unique())
+selected_customers = st.sidebar.multiselect("Filter by Customer", customers, default=customers)
+
+# Move Refresh Data button to the bottom of the sidebar
+st.sidebar.markdown("---") # Optional: add a separator
+if st.sidebar.button("Refresh Customer Order Data", help="Clear cache and reload all data from files."):
+    st.cache_data.clear()
+    st.rerun()
+
+
+# Load and Aggregate Shipment Data
+full_data = load_and_aggregate_shipment_data(MONTHLY_DIR_PATH, start_date, end_date, CURRENT_YEAR, key_set)
+
+if full_data.empty:
+    st.error("No shipment data found for the selected date range. Please check your files and dates.")
+    st.stop()
+
+# Merge and Filter Data
+full_data_merged = full_data.merge(
+    df_key[['Customer Part Number', 'Part Type', 'Customer']],
+    left_on='NormPart',
+    right_on='Customer Part Number',
+    how='left'
+)
+full_data_merged = full_data_merged[
+    full_data_merged['Part Type'].isin(selected_types) &
+    full_data_merged['Customer'].isin(selected_customers)
+]
+full_data_merged = full_data_merged.drop(columns=['Customer Part Number'])
+
+
+# Pivot into summary
+pivot = full_data_merged.pivot_table(
+    index='NormPart',
+    columns='Date',
+    values='Volume',
+    aggfunc='sum',
+    fill_value=0
+)
+
+target_idx = sorted(set(pivot.index).union(key_set))
+pivot = pivot.reindex(target_idx, fill_value=0)
+all_dates = pd.date_range(start_date, end_date)
+pivot = pivot.reindex(columns=all_dates, fill_value=0)
+
+col_map = {dt: f"{dt.day}-{dt.strftime('%b')}" for dt in all_dates}
+pivot.rename(columns=col_map, inplace=True)
+
+# Build final DataFrame
+pivot = pivot.reset_index().rename(columns={'NormPart':'Customer Part Number'})
+df_summary = df_key.merge(pivot, on='Customer Part Number', how='right')
+
+day_cols = [c for c in df_summary.columns if c not in ['Customer Part Number','Description','AACT Part Number','Part Type','Customer']]
+cols = ['AACT Part Number','Customer Part Number','Description','Part Type','Customer'] + day_cols
+
+df_summary = df_summary[
+    df_summary['Part Type'].isin(selected_types) &
+    df_summary['Customer'].isin(selected_customers)
+]
+
+df_summary = df_summary[cols].reset_index(drop=True)
+
+# Flag unknown parts
+unknowns = sorted(set(full_data['NormPart']) - key_set)
+if unknowns:
+    with st.sidebar.expander("Unknown Parts (Not in Key)"):
+        st.write(unknowns)
+
+# Ensure unique columns
+if df_summary.columns.duplicated().any():
+    dupes = df_summary.columns[df_summary.columns.duplicated()].tolist()
+    st.warning(f"Dropping duplicate columns: {dupes}")
+    df_summary = df_summary.loc[:,~df_summary.columns.duplicated()]
+
+# Shipment Overview Display with Styling
+st.subheader(f"Shipments from **{start_date.strftime('%Y-%m-%d')}** to **{end_date.strftime('%Y-%m-%d')}**")
+
+# Identify weekend and today's columns for styling (Forecast removed)
+today_actual = datetime.today().date()
+today_fmt = f"{today_actual.day}-{today_actual.strftime('%b')}"
+
+weekend_cols = []
+
+for col_name in day_cols:
+    try:
+        day_num, month_abbr = col_name.split('-')
+        month_index = list(calendar.month_abbr).index(month_abbr.capitalize())
+        dt_col = date(CURRENT_YEAR, month_index, int(day_num))
+        
+        if dt_col.weekday() >= 5: # Saturday (5) or Sunday (6)
+            weekend_cols.append(col_name)
+    except (ValueError, IndexError):
+        continue
+
+# --- Color Key (Forecast removed) ---
+st.markdown("""
+<style>
+.color-box {
+    width: 20px;
+    height: 20px;
+    border: 1px solid #ccc;
+    display: inline-block;
+    vertical-align: middle;
+    margin-right: 5px;
+    border-radius: 3px;
+}
+.legend-item {
+    display: inline-block;
+    margin-right: 20px;
+    font-size: 0.9em;
+}
+</style>
+<div style="margin-bottom: 15px;">
+    <span class="legend-item">
+        <span class="color-box" style="background-color: lightgreen;"></span> <b>Today</b>
+    </span>
+    <span class="legend-item">
+        <span class="color-box" style="background-color: lightgrey;"></span> Weekend
+    </span>
+</div>
+""", unsafe_allow_html=True)
+
+
+# --- REVISED STYLING FUNCTION FOR CELL-LEVEL CONTROL (Forecast removed) ---
+def apply_conditional_styles(df):
+    
+    df_styles = pd.DataFrame('', index=df.index, columns=df.columns)
+    
+    for col_name in df.columns:
+        if col_name in day_cols:
+            
+            cell_style = ""
+            
+            # Apply styling based on priority: Today > Weekend
+            
+            # 1. Apply Weekend background
+            if col_name in weekend_cols:
+                cell_style += 'background-color: lightgrey;'
+            
+            # 2. Apply Today's background (overrides weekend if today is a weekend)
+            if col_name == today_fmt:
+                cell_style += 'background-color: lightgreen;'
+            
+            if cell_style:
+                df_styles[col_name] = cell_style
+                    
+    return df_styles
+
+# Apply the revised styling function to the DataFrame.
+styled_df = df_summary.style.apply(apply_conditional_styles, axis=None)
+
+# --- Display with st.dataframe ---
+# Note: st.dataframe does not natively support sticky/locked columns.
+# For this feature, you would typically use a custom component like 'streamlit-aggrid'.
+st.dataframe(styled_df, use_container_width=True, hide_index=True)
+
+# NEW: Add Download as Excel button
+# Use BytesIO to create an in-memory binary stream for the Excel file
+excel_buffer = io.BytesIO()
+# Apply the styling and save to Excel
+styled_df.to_excel(excel_buffer, index=False, engine='openpyxl')
+excel_buffer.seek(0) # Rewind the buffer to the beginning
+
+st.download_button(
+    label="Download as Excel (with colors)",
+    data=excel_buffer,
+    file_name=f"AACT_Shipment_Overview_{start_date}_{end_date}.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    help="Download the current table data with colors for weekends and today."
+)
